@@ -10,6 +10,11 @@ load_dotenv()
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 
+# GPT-5.6 Terra standard short-context rates (USD per 1M tokens)
+PRICE_INPUT_PER_M = 2.00
+PRICE_CACHED_INPUT_PER_M = 0.20
+PRICE_OUTPUT_PER_M = 12.00
+
 app = FastAPI(title="OpenAI Research API")
 
 
@@ -19,6 +24,8 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+    tokens_used: int
+    cost_usd: float
     model: str
     sources: list[str] = Field(default_factory=list)
 
@@ -59,6 +66,21 @@ def extract_sources(response) -> list[str]:
     return sources
 
 
+def usage_metrics(response) -> tuple[int, float]:
+    usage = response.usage
+    if usage is None:
+        return 0, 0.0
+
+    cached = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else 0
+    uncached_input = max(usage.input_tokens - cached, 0)
+    cost = (
+        (uncached_input / 1_000_000) * PRICE_INPUT_PER_M
+        + (cached / 1_000_000) * PRICE_CACHED_INPUT_PER_M
+        + (usage.output_tokens / 1_000_000) * PRICE_OUTPUT_PER_M
+    )
+    return usage.total_tokens, round(cost, 6)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -87,8 +109,11 @@ def ask(request: AskRequest) -> AskResponse:
     if not answer:
         raise HTTPException(status_code=502, detail="OpenAI returned an empty response")
 
+    tokens_used, cost_usd = usage_metrics(response)
     return AskResponse(
         answer=answer,
+        tokens_used=tokens_used,
+        cost_usd=cost_usd,
         model=DEFAULT_MODEL,
         sources=extract_sources(response),
     )
