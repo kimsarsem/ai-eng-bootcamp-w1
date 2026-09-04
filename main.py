@@ -1,4 +1,5 @@
 import os
+import re
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -15,11 +16,21 @@ PRICE_INPUT_PER_M = 2.00
 PRICE_CACHED_INPUT_PER_M = 0.20
 PRICE_OUTPUT_PER_M = 12.00
 
+# Injected when force_bad=true so the output guardrail has something to catch.
+FORCE_BAD_ANSWER = (
+    "FORCE_BAD_OUTPUT: The capital of France is Berlin. "
+    "Source: https://totally-fake-news.example/made-up-citation"
+)
+
 app = FastAPI(title="OpenAI Research API")
 
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Question to research and answer")
+    force_bad: bool = Field(
+        default=False,
+        description="Demo flag: inject intentionally bad output so the guardrail can catch it",
+    )
 
 
 class AskResponse(BaseModel):
@@ -28,6 +39,8 @@ class AskResponse(BaseModel):
     cost_usd: float
     model: str
     sources: list[str] = Field(default_factory=list)
+    guardrail_passed: bool = True
+    guardrail_reason: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -81,6 +94,28 @@ def usage_metrics(response) -> tuple[int, float]:
     return usage.total_tokens, round(cost, 6)
 
 
+def run_output_guardrail(answer: str) -> tuple[bool, str | None]:
+    """Return (passed, reason). Blocks empty, demo-bad, and clearly fabricated answers."""
+    text = (answer or "").strip()
+    if not text:
+        return False, "empty_answer"
+
+    if "FORCE_BAD_OUTPUT" in text:
+        return False, "force_bad_marker"
+
+    if re.search(r"totally-fake-news\.example", text, re.IGNORECASE):
+        return False, "fabricated_source"
+
+    # Obvious falsehood used by the force_bad demo payload
+    if re.search(r"capital of France is Berlin", text, re.IGNORECASE):
+        return False, "known_false_claim"
+
+    if len(text) < 8:
+        return False, "answer_too_short"
+
+    return True, None
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -88,6 +123,22 @@ def health() -> dict[str, str]:
 
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest) -> AskResponse:
+    # Demo path: inject bad output without spending tokens, then let the guardrail catch it.
+    if request.force_bad:
+        passed, reason = run_output_guardrail(FORCE_BAD_ANSWER)
+        return AskResponse(
+            answer=(
+                "Blocked by output guardrail. "
+                f"Reason: {reason}. Original bad output was not returned to the client."
+            ),
+            tokens_used=0,
+            cost_usd=0.0,
+            model=DEFAULT_MODEL,
+            sources=[],
+            guardrail_passed=passed,
+            guardrail_reason=reason,
+        )
+
     try:
         client = get_openai_client()
         response = client.responses.create(
@@ -110,12 +161,29 @@ def ask(request: AskRequest) -> AskResponse:
         raise HTTPException(status_code=502, detail="OpenAI returned an empty response")
 
     tokens_used, cost_usd = usage_metrics(response)
+    passed, reason = run_output_guardrail(answer)
+    if not passed:
+        return AskResponse(
+            answer=(
+                "Blocked by output guardrail. "
+                f"Reason: {reason}. Original model output was not returned to the client."
+            ),
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            model=DEFAULT_MODEL,
+            sources=[],
+            guardrail_passed=False,
+            guardrail_reason=reason,
+        )
+
     return AskResponse(
         answer=answer,
         tokens_used=tokens_used,
         cost_usd=cost_usd,
         model=DEFAULT_MODEL,
         sources=extract_sources(response),
+        guardrail_passed=True,
+        guardrail_reason=None,
     )
 
 
